@@ -308,11 +308,15 @@ async def start_session(req: StartSessionRequest, conn=Depends(get_db)):
         WHERE student_id = $1 AND status = 'IN_PROGRESS';
     """, student_id)
 
-    # Fetch all previously seen question IDs for anti-repetition logic
+    # Fetch per-question view counts for anti-repetition ordering.
+    # A question cannot re-enter the queue until every other question in its pool
+    # has been seen at least as many times (min-view-count fairness).
     answered_rows = await conn.fetch(
-        "SELECT DISTINCT question_id FROM logs WHERE student_id = $1;", student_id
+        "SELECT question_id, COUNT(*) AS view_count FROM logs WHERE student_id = $1 GROUP BY question_id;",
+        student_id
     )
-    answered_qids = set(row['question_id'] for row in answered_rows)
+    # Maps question_id → times seen (0 implicitly for questions not in the map)
+    answered_counts: dict = {row['question_id']: int(row['view_count']) for row in answered_rows}
 
     # Query all questions for selected topics
     all_questions = await conn.fetch(
@@ -350,29 +354,57 @@ async def start_session(req: StartSessionRequest, conn=Depends(get_db)):
         for q in q_pool:
             by_topic.setdefault(q['topic'], []).append(q)
 
-        # Build per-topic candidate lists with anti-repetition and model coverage
+        # Build per-topic candidate lists with min-view-count anti-repetition and model coverage.
+        # Strategy: among all questions in a pool, always serve those with the lowest view count
+        # first. A question cannot re-enter the queue until every other question in its pool
+        # has been seen at least as many times — enforcing strict round-based fairness.
         candidates_by_topic: dict = {}
         for t, q_list in by_topic.items():
-            unseen = [q for q in q_list if q['question_id'] not in answered_qids]
-            seen   = [q for q in q_list if q['question_id'] in answered_qids]
+            unseen = [q for q in q_list if q['question_id'] not in answered_counts]
+            seen   = [q for q in q_list if q['question_id'] in answered_counts]
             random.shuffle(unseen)
             random.shuffle(seen)
             # Prefer unseen; fall back to seen only if all questions are exhausted
             allowed_for_topic = unseen if unseen else seen
 
             if t in topics_with_models:
-                models_in_level = {q['model'] for q in allowed_for_topic if q.get('model')}
+                # ── Model-based topics: per-model min-view-count anti-repetition ─────
+                # Each model independently tracks its own minimum view count, so an
+                # exhausted model (all questions seen N times) can fall into its own
+                # N-th round without affecting models still completing round N-1.
+                models_in_level = {q['model'] for q in q_list if q.get('model')}
                 if models_in_level:
-                    by_model = {m: [] for m in models_in_level}
-                    no_model_qs = []
-                    for q in allowed_for_topic:
+                    by_model: dict = {m: [] for m in models_in_level}
+                    no_model_qs: list = []
+                    for q in q_list:
                         (by_model[q['model']] if q.get('model') else no_model_qs).append(q)
 
-                    for m in by_model:
+                    # Per-model min-view-count filter: only questions at the minimum
+                    # view count for that model enter the candidate pool.
+                    for m in list(by_model.keys()):
+                        min_v = min(
+                            (answered_counts.get(q['question_id'], 0) for q in by_model[m]),
+                            default=0
+                        )
+                        by_model[m] = [
+                            q for q in by_model[m]
+                            if answered_counts.get(q['question_id'], 0) == min_v
+                        ]
                         random.shuffle(by_model[m])
-                    random.shuffle(no_model_qs)
 
-                    # Round-robin across models to ensure full model coverage
+                    # Questions with no model tag: topic-level min-view-count filter
+                    if no_model_qs:
+                        min_v_nm = min(
+                            (answered_counts.get(q['question_id'], 0) for q in no_model_qs),
+                            default=0
+                        )
+                        no_model_qs = [
+                            q for q in no_model_qs
+                            if answered_counts.get(q['question_id'], 0) == min_v_nm
+                        ]
+                        random.shuffle(no_model_qs)
+
+                    # Round-robin across models to ensure full model coverage early
                     active_models = list(models_in_level)
                     random.shuffle(active_models)
                     model_indices = {m: 0 for m in active_models}
@@ -389,12 +421,31 @@ async def start_session(req: StartSessionRequest, conn=Depends(get_db)):
                     topic_candidates.extend(no_model_qs)
                     candidates_by_topic[t] = topic_candidates
                 else:
-                    candidates_by_topic[t] = allowed_for_topic
+                    # Topic flagged as model-based but no model data found —
+                    # fall back to topic-level min-view-count anti-repetition
+                    min_v = min(
+                        (answered_counts.get(q['question_id'], 0) for q in q_list),
+                        default=0
+                    )
+                    pool = [q for q in q_list if answered_counts.get(q['question_id'], 0) == min_v]
+                    random.shuffle(pool)
+                    candidates_by_topic[t] = pool
             else:
-                candidates_by_topic[t] = allowed_for_topic
+                # ── Topics without models: topic-level min-view-count anti-repetition ──
+                # Only questions tied for the fewest views in this topic+level are
+                # offered as candidates. Once every question has been seen at least
+                # once, the minimum rises to 1, and so on for subsequent rounds.
+                min_v = min(
+                    (answered_counts.get(q['question_id'], 0) for q in q_list),
+                    default=0
+                )
+                pool = [q for q in q_list if answered_counts.get(q['question_id'], 0) == min_v]
+                random.shuffle(pool)
+                candidates_by_topic[t] = pool
 
         # Round-robin across topics to interleave questions from different subjects
         selected_qs: list = []
+        seen_qids: set   = set()   # deduplication guard — a question appears at most once
         active_topics = list(candidates_by_topic.keys())
         random.shuffle(active_topics)
         topic_indices = {t: 0 for t in active_topics}
@@ -404,11 +455,43 @@ async def start_session(req: StartSessionRequest, conn=Depends(get_db)):
             for t in active_topics:
                 idx = topic_indices[t]
                 if idx < len(candidates_by_topic[t]):
-                    selected_qs.append(candidates_by_topic[t][idx])
+                    q = candidates_by_topic[t][idx]
                     topic_indices[t] += 1
                     added = True
+                    if q['question_id'] not in seen_qids:
+                        selected_qs.append(q)
+                        seen_qids.add(q['question_id'])
                     if len(selected_qs) == 10:
                         break
+
+        # ── Model-coverage guarantee ────────────────────────────────────────────
+        # If the 10-question cap was hit and a topic with models still has models
+        # that haven't been represented, extend the queue beyond 10 until every
+        # model in every topic appears at least once in this level's queue.
+        for t in active_topics:
+            if t not in topics_with_models:
+                continue
+            # Determine which models are already represented in selected_qs for this topic
+            models_in_level = {
+                q['model'] for q in candidates_by_topic[t] if q.get('model')
+            }
+            covered_models = {
+                q['model'] for q in selected_qs
+                if q.get('topic') == t and q.get('model')
+            }
+            missing_models = models_in_level - covered_models
+            if not missing_models:
+                continue
+            # Walk the remaining candidates for this topic (past the 10-q pointer)
+            idx = topic_indices[t]
+            while missing_models and idx < len(candidates_by_topic[t]):
+                q = candidates_by_topic[t][idx]
+                idx += 1
+                if q['question_id'] not in seen_qids and q.get('model') in missing_models:
+                    selected_qs.append(q)
+                    seen_qids.add(q['question_id'])
+                    missing_models.discard(q['model'])
+            topic_indices[t] = idx  # keep pointer in sync
 
         selected = [q['question_id'] for q in selected_qs]
         if not selected:
