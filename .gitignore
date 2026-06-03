@@ -1,0 +1,32 @@
+# Testing files
+*test*.py
+verify_logic.py
+db_inspect.py
+
+# Simulation files
+*simulation*.py
+run_simulation*.py
+
+# Sensitive / local config
+*.env
+.env.*
+config.py
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
