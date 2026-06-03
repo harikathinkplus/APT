@@ -2,8 +2,9 @@ import os
 import uuid
 import json
 import random
-import hashlib
 import psycopg2
+from passlib.hash import bcrypt as bcrypt_ctx
+from dotenv import load_dotenv
 from psycopg2.extras import RealDictCursor, Json
 from psycopg2.pool import ThreadedConnectionPool
 from fastapi import FastAPI, Depends, HTTPException, Request, status, BackgroundTasks
@@ -14,13 +15,16 @@ from pydantic import BaseModel
 from typing import List, Optional, Any
 import atexit
 
+load_dotenv()
+
 # Initialize FastAPI application
 app = FastAPI(title="Adaptive Practice Tool API")
 
 # Enable Cross-Origin Resource Sharing (CORS)
+_cors_origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -45,24 +49,33 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         content={"error": f"Validation failed: {error_msg} at {field}"},
     )
 
-# Database connection parameters for PostgreSQL
+# Database connection parameters — loaded from environment variables (see .env.example)
 DB_PARAMS = {
-    "host": "localhost",
-    "port": 5432,
-    "database": "adaptive_practice_db",
-    "user": "postgres",
-    "password": "Satya@17"
+    "host": os.getenv("DB_HOST", "localhost"),
+    "port": int(os.getenv("DB_PORT", 5432)),
+    "database": os.getenv("DB_NAME", "adaptive_practice_db"),
+    "user": os.getenv("DB_USER", "postgres"),
+    "password": os.getenv("DB_PASSWORD"),
 }
 
-# Thread-safe database connection pool (connection load balancer)
-db_pool = ThreadedConnectionPool(1, 20, **DB_PARAMS, cursor_factory=RealDictCursor)
+# Thread-safe database connection pool (min/max tunable via env)
+db_pool = ThreadedConnectionPool(
+    int(os.getenv("DB_POOL_MIN", 2)),
+    int(os.getenv("DB_POOL_MAX", 20)),
+    **DB_PARAMS,
+    cursor_factory=RealDictCursor
+)
 
 # Graceful cleanup of connection pool at app exit
 atexit.register(db_pool.closeall)
 
 def hash_password(password: str) -> str:
-    # Computes the SHA-256 hash of a password string and returns its hex representation.
-    return hashlib.sha256(password.encode('utf-8')).hexdigest()
+    # Hashes a password using bcrypt (work factor 12) — resistant to brute-force attacks.
+    return bcrypt_ctx.hash(password)
+
+def verify_password(plain: str, hashed: str) -> bool:
+    # Safely verifies a plain-text password against a stored bcrypt hash.
+    return bcrypt_ctx.verify(plain, hashed)
 
 def get_level_rank(level_str):
     # Normalizes a text-based difficulty level string into an integer rank (1 to 5).
@@ -148,11 +161,11 @@ def async_complete_session_worker(session_id, student_id, report):
         cursor = conn.cursor()
         cursor.execute("UPDATE practice_sessions SET status = 'COMPLETED', updated_at = CURRENT_TIMESTAMP WHERE session_id = %s;", (session_id,))
         cursor.execute("UPDATE students SET no_of_tests = no_of_tests + 1 WHERE student_id = %s;", (student_id,))
+        # Insert structured report into session_reports (replaces unbounded cumulative_report TEXT)
         cursor.execute("""
-            UPDATE students 
-            SET cumulative_report = COALESCE(cumulative_report, '') || '\n' || %s
-            WHERE student_id = %s;
-        """, (json.dumps(report), student_id))
+            INSERT INTO session_reports (session_id, student_id, report)
+            VALUES (%s, %s, %s);
+        """, (session_id, student_id, Json(report)))
         conn.commit()
     except Exception as e:
         conn.rollback()
@@ -226,7 +239,7 @@ def login(req: LoginRequest, db=Depends(get_db)):
     cursor.execute("SELECT * FROM students WHERE email = %s;", (req.email,))
     student = cursor.fetchone()
     
-    if student and student['password_hash'] == hash_password(req.password):
+    if student and verify_password(req.password, student['password_hash']):
         student_data = dict(student)
         student_data.pop('password_hash') # Exclude password hash from response payload
         return student_data
@@ -443,8 +456,9 @@ def start_session(req: StartSessionRequest, db=Depends(get_db)):
             
         # Initialize state structure for the level
         levels_progress[str(rank)] = {
-            "queue": selected, # FIFO list of question IDs to be answered
-            "answered": {}     # mapping of question_id -> answers submitted during this session
+            "queue": selected,     # Ordered list of question IDs for this level
+            "current_index": 0,    # Pointer into queue — O(1) advancement, avoids list.pop(0)
+            "answered": {}         # question_id -> answer details submitted during this session
         }
         
     # Verify that we succeeded in populating at least one difficulty level
@@ -518,9 +532,10 @@ def submit_answer(req: SubmitAnswerRequest, background_tasks: BackgroundTasks, d
     progress = session['session_progress']
     current_level = str(session['current_level'])
     level_progress = progress['levels'][current_level]
+    current_idx = level_progress.get('current_index', 0)
     
-    # Enforce FIFO Queue order: must answer the question at the front of the queue
-    if not level_progress['queue'] or level_progress['queue'][0] != question_id:
+    # Enforce FIFO Queue order: must answer the question at the current pointer position
+    if current_idx >= len(level_progress['queue']) or level_progress['queue'][current_idx] != question_id:
         raise HTTPException(status_code=400, detail="Submitted question is not at the front of the queue")
         
     # Fetch question details to retrieve the correct answer and metadata
@@ -593,18 +608,21 @@ def submit_answer(req: SubmitAnswerRequest, background_tasks: BackgroundTasks, d
             SET current_streak = 0;
         """, (student_id, topic))
         
-    # Dequeue the answered question from the level's queue list
-    level_progress['queue'].pop(0)
+    # Advance the queue pointer — O(1) vs O(n) list.pop(0)
+    level_progress['current_index'] = current_idx + 1
     
-    # Record response details in the answered dictionary of session state
+    # Record response details in the answered dict
+    # Storing topic and level here eliminates an extra DB query in submit_session
     level_progress['answered'][question_id] = {
         "selected_option": selected_option,
         "is_correct": is_correct,
-        "time_taken_seconds": time_taken
+        "time_taken_seconds": time_taken,
+        "topic": topic,
+        "level": level,
     }
     
     # Evaluate if the active level queue has been completely answered
-    level_completed = (len(level_progress['queue']) == 0)
+    level_completed = (level_progress['current_index'] >= len(level_progress['queue']))
     
     max_unlocked = session['max_unlocked_level']
     accuracy_achieved = False
@@ -635,7 +653,7 @@ def submit_answer(req: SubmitAnswerRequest, background_tasks: BackgroundTasks, d
     # Retrieve the next question from the queue list
     next_question = None
     if not level_completed:
-        next_qid = level_progress['queue'][0]
+        next_qid = level_progress['queue'][level_progress['current_index']]
         query = (
             "SELECT question_id, question, options, topic, level, model "
             "FROM questions "
@@ -730,9 +748,10 @@ def change_level(req: ChangeLevelRequest, db=Depends(get_db)):
     history = {}
     
     # Serve questions or load historical answers depending on completion status
-    if level_progress['queue']:
+    current_idx = level_progress.get('current_index', 0)
+    if current_idx < len(level_progress['queue']):
         # Active level has questions remaining in queue. Serve front question.
-        active_qid = level_progress['queue'][0]
+        active_qid = level_progress['queue'][current_idx]
         query = (
             "SELECT question_id, question, options, topic, level, model "
             "FROM questions "
@@ -796,17 +815,8 @@ def submit_session(req: SessionActionRequest, background_tasks: BackgroundTasks,
     student_id = session['student_id']
     progress = session['session_progress']
     
-    # Collect all answered question IDs across all levels for batch topic querying
-    answered_qids = []
-    for lvl_rank, lvl_progress in progress['levels'].items():
-        answered_qids.extend(list(lvl_progress['answered'].keys()))
-        
-    qid_to_topic = {}
-    if answered_qids:
-        cursor.execute("SELECT question_id, topic FROM questions WHERE question_id = ANY(%s);", (answered_qids,))
-        qid_to_topic = {row['question_id']: row['topic'] for row in cursor.fetchall()}
-    
     # Compile session report metrics
+    # Note: topic is now stored directly in each answered dict entry — no extra DB query needed
     total_questions = 0
     total_answered = 0
     correct_count = 0
@@ -814,8 +824,8 @@ def submit_session(req: SessionActionRequest, background_tasks: BackgroundTasks,
     topic_summary = {}
     
     for lvl_rank, lvl_progress in progress['levels'].items():
-        # Add up remaining queued questions plus answered ones to find total level count
-        total_questions += len(lvl_progress['queue']) + len(lvl_progress['answered'])
+        # Queue is never mutated (pointer-based), so its length equals the initial pool size
+        total_questions += len(lvl_progress['queue'])
         
         # Retrieve details of answered questions
         for qid, ans in lvl_progress['answered'].items():
@@ -824,8 +834,8 @@ def submit_session(req: SessionActionRequest, background_tasks: BackgroundTasks,
             if ans.get('is_correct'):
                 correct_count += 1
                 
-            # Retrieve topic from batch fetched dictionary
-            q_topic = qid_to_topic.get(qid, 'Unknown')
+            # Topic stored directly in answered dict — avoids extra DB round-trip
+            q_topic = ans.get('topic', 'Unknown')
             
             # Keep running track of topic-based performance metrics
             if q_topic not in topic_summary:
@@ -854,6 +864,11 @@ def submit_session(req: SessionActionRequest, background_tasks: BackgroundTasks,
     background_tasks.add_task(async_complete_session_worker, session_id, student_id, report)
     
     return report
+
+@app.get("/api/health")
+def health_check():
+    """Health check endpoint for load balancers and uptime monitors."""
+    return {"status": "ok"}
 
 # Start Uvicorn Web Server
 if __name__ == '__main__':

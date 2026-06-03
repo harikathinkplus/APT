@@ -8,8 +8,10 @@ db_inspect.py
 run_simulation*.py
 
 # Sensitive / local config
-*.env
-.env.*
+.env
+.env.local
+.env.production
+.env.development
 config.py
 
 # Python cache
